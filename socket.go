@@ -51,12 +51,12 @@ func NotifySocket() (*net.UnixConn, error) {
 		return nil, ErrNoSocket
 	}
 
-	conn, err := net.ListenUnixgram(addr.Net, addr)
+	conn, err := net.ListenPacket(addr.Net, addr.String())
 	if err != nil {
 		return nil, err
 	}
 
-	return conn, nil
+	return conn.(*net.UnixConn), nil
 }
 
 // Send is like sd_notify (https://www.freedesktop.org/software/systemd/man/latest/sd_notify.html#Description),
@@ -171,4 +171,18 @@ func readMsg(conn *net.UnixConn, state []byte) (n int, fd *os.File, err error) {
 		return n, os.NewFile(uintptr(fds[0]), "<socketconn>"), nil
 	}
 	return n, nil, nil
+}
+
+func socketUnixgram(name string) (*net.UnixConn, error) {
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, os.NewSyscallError("socket", err)
+	}
+	defer unix.Close(fd)
+	conn, err := net.FileConn(os.NewFile(uintptr(fd), name))
+	if err != nil {
+		return nil, err
+	}
+	unixConn := conn.(*net.UnixConn)
+	return unixConn, nil
 }

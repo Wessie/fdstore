@@ -9,18 +9,20 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
-	"syscall"
 
 	"github.com/justincormack/go-memfd"
-	"golang.org/x/sys/unix"
 )
 
 var (
 	ErrShortWrite = errors.New("short write")
 	ErrNoFile     = errors.New("File method missing")
-	ErrNoSocket   = errors.New("NOTIFY_SOCKET is empty")
+	ErrNoFiles    = errors.New("received no files from parent")
+	ErrNoSocket   = errors.New("NOTIFY_SOCKET envvar is empty")
 	ErrNotOurName = errors.New("FDNAME was not the correct format")
+	ErrWrongType  = errors.New("fd is of the wrong type")
+	ErrDataRead   = errors.New("failed to read data from memfd")
 )
 
 const (
@@ -36,18 +38,41 @@ type Filer interface {
 
 func NewEntry(name string, file *os.File, data []byte) Entry {
 	return Entry{
-		ID:   incrementalID.Add(1),
-		Name: name,
+		shared: shared{
+			ID:   incrementalID.Add(1),
+			Name: name,
+			Data: data,
+		},
 		File: file,
-		Data: data,
 	}
 }
 
-type Entry struct {
-	ID   uint64
+type shared struct {
+	// ID is a 'unique' id for this entry, it's an atomically incrementing integer,
+	// used to match the File and Data together after passing over
+	ID uint64
+	// Name is the name for this entry, this is how the user looks us up
 	Name string
-	File *os.File
+	// Data is the data associated with this entry, this can be anything
 	Data []byte
+}
+
+type Entry struct {
+	shared
+	// File is the file associated with this entry
+	File *os.File
+}
+
+// ConnEntry is the type returned by the RemoveConn helper
+type ConnEntry struct {
+	shared
+	Conn net.Conn
+}
+
+// ListenerEntry is the type returned by the RemoveListener helper
+type ListenerEntry struct {
+	shared
+	Listener net.Listener
 }
 
 func (e Entry) dataToFd() (*os.File, error) {
@@ -124,6 +149,7 @@ func parseName(name string) (parsedName, error) {
 }
 
 type Store struct {
+	mu      sync.Mutex
 	entries map[uint64]Entry
 }
 
@@ -133,7 +159,7 @@ func NewStoreFromListenFDS() (*Store, error) {
 	// get our files from the systemd environment variables
 	files := ListenFDs()
 	if files == nil {
-		return nil, ErrNoFile
+		return nil, ErrNoFiles
 	}
 
 	for name, file := range files {
@@ -152,7 +178,7 @@ func NewStoreFromListenFDS() (*Store, error) {
 			// read the whole file into memory
 			data, err := io.ReadAll(file)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("%w: %w", ErrDataRead, err)
 			}
 			entry.Data = data
 		}
@@ -167,8 +193,18 @@ func NewStoreFromListenFDS() (*Store, error) {
 	return &store, nil
 }
 
-func AsConn(file *os.File) (net.Conn, error) {
+func asConnWithoutClose(file *os.File) (net.Conn, error) {
 	conn, err := net.FileConn(file)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrWrongType, err)
+	}
+	return conn, nil
+}
+
+// AsConn is a helper function that tries to convert the file given
+// to a net.Conn, the passed in file is closed on success
+func AsConn(file *os.File) (net.Conn, error) {
+	conn, err := asConnWithoutClose(file)
 	if err != nil {
 		return nil, err
 	}
@@ -176,8 +212,18 @@ func AsConn(file *os.File) (net.Conn, error) {
 	return conn, nil
 }
 
-func AsListener(file *os.File) (net.Listener, error) {
+func asListenerWithoutClose(file *os.File) (net.Listener, error) {
 	ln, err := net.FileListener(file)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrWrongType, err)
+	}
+	return ln, nil
+}
+
+// AsListener is a helper function that tries to convert the file given
+// to a net.Listener, the passed in file is closed on success
+func AsListener(file *os.File) (net.Listener, error) {
+	ln, err := asListenerWithoutClose(file)
 	if err != nil {
 		return nil, err
 	}
@@ -185,7 +231,7 @@ func AsListener(file *os.File) (net.Listener, error) {
 	return ln, nil
 }
 
-func SendStore(conn *net.UnixConn, s Store) error {
+func SendStore(conn *net.UnixConn, s *Store) error {
 	addr := conn.RemoteAddr().(*net.UnixAddr)
 
 	for _, e := range s.entries {
@@ -194,13 +240,13 @@ func SendStore(conn *net.UnixConn, s Store) error {
 
 		err := sendMsg(conn, addr, []byte(state), e.File)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to send file message: %w", err)
 		}
 
 		// then prep our data
 		dataFd, err := e.dataToFd()
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to prep data memfd: %w", err)
 		}
 		defer dataFd.Close()
 
@@ -209,70 +255,151 @@ func SendStore(conn *net.UnixConn, s Store) error {
 
 		err = sendMsg(conn, addr, []byte(state), dataFd)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to send data message: %w", err)
 		}
 	}
 
 	return nil
 }
 
-func sendMsg(conn *net.UnixConn, addr *net.UnixAddr, state []byte, file *os.File) error {
-	oob := unix.UnixRights(int(file.Fd()))
-	n, oobn, err := conn.WriteMsgUnix(state, oob, addr)
-	if err != nil {
-		return err
+// RemoveFile finds and removes the entries associated with the name given
+// and returns them.
+func (s *Store) RemoveFile(name string) []Entry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var res []Entry
+	for id, entry := range s.entries {
+		if entry.Name != name {
+			continue
+		}
+
+		res = append(res, entry)
+		delete(s.entries, id)
 	}
-	if n < len(state) {
-		return ErrShortWrite
-	}
-	if oobn < len(oob) {
-		return ErrShortWrite
-	}
-	return nil
+	return res
 }
 
-const scmBufSize = 64
+// RemoveConn finds and removes the entries associated with the name given
+// and tries to return them as net.Conn, entries are not removed or returned
+// if an error occurs.
+//
+// Returns error matching ErrWrongType if an entry could not be converted
+func (s *Store) RemoveConn(name string) (res []ConnEntry, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-func readMsg(conn *net.UnixConn, state []byte) (n int, fd *os.File, err error) {
-	oob := make([]byte, scmBufSize)
-	n, oobn, _, _, err := conn.ReadMsgUnix(state, oob)
-	if err != nil {
-		return n, nil, err
-	}
-	oob = oob[:oobn]
-	if len(oob) > 0 {
-		scm, err := syscall.ParseSocketControlMessage(oob)
+	defer func() {
+		// if we error, we need to close all the conns that we already made
+		// before returning, or we would be leaking their fds
+		if err == nil {
+			return
+		}
+
+		for _, e := range res {
+			e.Conn.Close()
+		}
+
+		res = nil
+	}()
+
+	var ids []uint64 // ids that match our name, for deletion later
+	for id, entry := range s.entries {
+		if entry.Name != name {
+			continue
+		}
+
+		// this will dup(2) the file
+		conn, err := asConnWithoutClose(entry.File)
 		if err != nil {
-			return n, nil, err
+			return nil, err
 		}
-		if len(scm) != 1 {
-			return n, nil, fmt.Errorf("%d socket control messages", len(scm))
-		}
-		fds, err := syscall.ParseUnixRights(&scm[0])
-		if err != nil {
-			return n, nil, fmt.Errorf("parsing unix rights: %s", err)
-		}
-		if len(fds) == 1 {
-			// try to set this fd as non-blocking
-			syscall.SetNonblock(fds[0], true)
-			return n, os.NewFile(uintptr(fds[0]), "<socketconn>"), nil
-		}
-		if len(fds) > 1 {
-			for i := range fds {
-				syscall.Close(fds[i])
-			}
-			return n, nil, fmt.Errorf("control message sent %d fds", len(fds))
-		}
-		// fallthrough; len(fds) == 0
+
+		res = append(res, ConnEntry{
+			shared: entry.shared,
+			Conn:   conn,
+		})
+		ids = append(ids, id)
 	}
-	return n, nil, nil
+
+	// only once we've collected all the entries with no
+	// error do we remove them from the map and close the
+	// original file
+	for _, id := range ids {
+		s.entries[id].File.Close()
+		delete(s.entries, id)
+	}
+
+	return res, nil
 }
 
+// RemoveConn finds and removes the entries associated with the name given
+// and tries to return them as net.Listener, entries are not removed or returned
+// if an error occurs.
+//
+// Returns error matching ErrWrongType if an entry could not be converted
+func (s *Store) RemoveListener(name string) (res []ListenerEntry, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	defer func() {
+		// if we error, we need to close all the listeners that we already made
+		// before returning, or we would be leaking their fds
+		if err == nil {
+			return
+		}
+
+		for _, e := range res {
+			e.Listener.Close()
+		}
+
+		res = nil
+	}()
+
+	var ids []uint64 // ids that match our name, for deletion later
+	for id, entry := range s.entries {
+		if entry.Name != name {
+			continue
+		}
+
+		// this will dup(2) the file
+		ln, err := asListenerWithoutClose(entry.File)
+		if err != nil {
+			return nil, err
+		}
+
+		res = append(res, ListenerEntry{
+			shared:   entry.shared,
+			Listener: ln,
+		})
+		ids = append(ids, id)
+	}
+
+	// only once we've collected all the entries with no
+	// error do we remove them from the map and close the
+	// original file
+	for _, id := range ids {
+		s.entries[id].File.Close()
+		delete(s.entries, id)
+	}
+
+	return res, nil
+}
+
+// AddFile adds a file to the store with the name given and associated data.
+// The data is stored in an memfd when passed through the socket and can be
+// any kind of data.
 func (s *Store) AddFile(fd *os.File, name string, data []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	entry := NewEntry(name, fd, data)
 	s.entries[entry.ID] = entry
 }
 
+// AddFiler is like AddFile but takes any type with a File() (*os.File, error) method
+//
+// Returns error from File() if any.
 func (s *Store) AddFiler(filer Filer, name string, data []byte) error {
 	fd, err := filer.File()
 	if err != nil {
@@ -282,16 +409,26 @@ func (s *Store) AddFiler(filer Filer, name string, data []byte) error {
 	return nil
 }
 
+// AddConn is like AddFile but takes a net.Conn, it is expected that the net.Conn
+// given implements Filer. Types from the net pkg generally do.
+//
+// Returns error matching ErrNoFile if no File method was found or whatever the call
+// to File() itself returns if it errors
 func (s *Store) AddConn(conn net.Conn, name string, data []byte) error {
 	if fder, ok := conn.(Filer); ok {
 		return s.AddFiler(fder, name, data)
 	}
-	return ErrNoFile
+	return fmt.Errorf("%w: found %T", ErrNoFile, conn)
 }
 
+// AddListener is like AddFile but takes a net.Listener, is is expected that the net.Listener
+// given implements Filer. Types from the net pkg generally do.
+//
+// Returns error matching ErrNoFile if no File method was found or whatever the call
+// to File() itself returns if it errors
 func (s *Store) AddListener(ln net.Listener, name string, state []byte) error {
 	if fder, ok := ln.(Filer); ok {
 		return s.AddFiler(fder, name, state)
 	}
-	return ErrNoFile
+	return fmt.Errorf("%w: found %T", ErrNoFile, ln)
 }

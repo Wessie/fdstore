@@ -98,3 +98,55 @@ func FD2Unix(fd int) (*net.UnixConn, error) {
 	}
 	return uc, nil
 }
+
+func sendMsg(conn *net.UnixConn, addr *net.UnixAddr, state []byte, file *os.File) error {
+	oob := unix.UnixRights(int(file.Fd()))
+	n, oobn, err := conn.WriteMsgUnix(state, oob, addr)
+	if err != nil {
+		return err
+	}
+	if n < len(state) {
+		return ErrShortWrite
+	}
+	if oobn < len(oob) {
+		return ErrShortWrite
+	}
+	return nil
+}
+
+const scmBufSize = 64
+
+func readMsg(conn *net.UnixConn, state []byte) (n int, fd *os.File, err error) {
+	oob := make([]byte, scmBufSize)
+	n, oobn, _, _, err := conn.ReadMsgUnix(state, oob)
+	if err != nil {
+		return n, nil, err
+	}
+	oob = oob[:oobn]
+	if len(oob) > 0 {
+		scm, err := syscall.ParseSocketControlMessage(oob)
+		if err != nil {
+			return n, nil, err
+		}
+		if len(scm) != 1 {
+			return n, nil, fmt.Errorf("%d socket control messages", len(scm))
+		}
+		fds, err := syscall.ParseUnixRights(&scm[0])
+		if err != nil {
+			return n, nil, fmt.Errorf("parsing unix rights: %s", err)
+		}
+		if len(fds) == 1 {
+			// try to set this fd as non-blocking
+			syscall.SetNonblock(fds[0], true)
+			return n, os.NewFile(uintptr(fds[0]), "<socketconn>"), nil
+		}
+		if len(fds) > 1 {
+			for i := range fds {
+				syscall.Close(fds[i])
+			}
+			return n, nil, fmt.Errorf("control message sent %d fds", len(fds))
+		}
+		// fallthrough; len(fds) == 0
+	}
+	return n, nil, nil
+}

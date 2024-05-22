@@ -63,5 +63,14 @@ func Errno(errno syscall.Errno) Variable {
 }
 
 func combine(vv ...Variable) Variable {
-	return strings.Join(vv, "\n")
+	var b strings.Builder
+
+	for _, v := range vv {
+		b.WriteString(v)
+		if !strings.HasSuffix(v, "\n") {
+			b.WriteRune('\n')
+		}
+	}
+
+	return b.String()
 }

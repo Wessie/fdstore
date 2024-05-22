@@ -68,18 +68,13 @@ func Send(conn *net.UnixConn, vars ...Variable) error {
 		if err != nil {
 			return err
 		}
+		defer conn.Close()
 		conn = ns
 	}
 
 	// construct our state line, these should be new-line separated
-	var state Variable
-	for _, v := range vars {
-		if !strings.HasSuffix(v, "\n") {
-			state = state + v + "\n"
-		} else {
-			state = state + v
-		}
-	}
+	state := combine(vars...)
+
 	_, err := conn.Write([]byte(state))
 	return err
 }

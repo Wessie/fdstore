@@ -12,18 +12,20 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/justincormack/go-memfd"
 )
 
 var (
-	ErrShortWrite = errors.New("short write")
-	ErrNoFile     = errors.New("File method missing")
-	ErrNoFiles    = errors.New("received no files from parent")
-	ErrNoSocket   = errors.New("NOTIFY_SOCKET envvar is empty")
-	ErrNotOurName = errors.New("FDNAME was not the correct format")
-	ErrWrongType  = errors.New("fd is of the wrong type")
-	ErrDataRead   = errors.New("failed to read data from memfd")
+	ErrShortWrite     = errors.New("short write")
+	ErrNoFile         = errors.New("File method missing")
+	ErrNoFiles        = errors.New("received no files from parent")
+	ErrNoSocket       = errors.New("NOTIFY_SOCKET envvar is empty")
+	ErrNotOurName     = errors.New("FDNAME was not the correct format")
+	ErrWrongType      = errors.New("fd is of the wrong type")
+	ErrDataRead       = errors.New("failed to read data from memfd")
+	ErrUnexpectedRead = errors.New("did not expect to read anything")
 )
 
 const (
@@ -285,7 +287,44 @@ func SendStore(conn *Conn, s *Store) error {
 		}
 	}
 
+	WaitBarrier(conn)
 	return nil
+}
+
+func WaitBarrier(conn *Conn) error {
+	// Create a pipe for communicating with systemd daemon.
+	pipeR, pipeW, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+
+	err = sendMsg(conn.conn, conn.raddr, []byte(Barrier), pipeW)
+	if err != nil {
+		return err
+	}
+
+	// Close our copy of pipeW.
+	err = pipeW.Close()
+	if err != nil {
+		return err
+	}
+
+	// Expect the read end of the pipe to be closed after 30 seconds.
+	err = pipeR.SetReadDeadline(time.Now().Add(30 * time.Second))
+	if err != nil {
+		return nil
+	}
+
+	// Read a single byte expecting EOF.
+	var buf [1]byte
+	n, err := pipeR.Read(buf[:])
+	if n != 0 || err == nil {
+		return ErrUnexpectedRead
+	} else if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, io.EOF) {
+		return nil
+	} else {
+		return err
+	}
 }
 
 // RemoveFile finds and removes the entries associated with the name given

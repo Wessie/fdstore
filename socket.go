@@ -51,7 +51,7 @@ func NotifySocket() (*net.UnixConn, error) {
 		return nil, ErrNoSocket
 	}
 
-	conn, err := net.DialUnix(addr.Net, nil, addr)
+	conn, err := net.ListenUnixgram(addr.Net, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -68,14 +68,14 @@ func Send(conn *net.UnixConn, vars ...Variable) error {
 		if err != nil {
 			return err
 		}
-		defer conn.Close()
+		defer ns.Close()
 		conn = ns
 	}
 
 	// construct our state line, these should be new-line separated
 	state := combine(vars...)
 
-	_, err := conn.Write([]byte(state))
+	_, err := conn.WriteTo([]byte(state), conn.LocalAddr())
 	return err
 }
 

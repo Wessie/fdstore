@@ -260,7 +260,7 @@ func AsListener(file *os.File) (net.Listener, error) {
 }
 
 func SendStore(conn *net.UnixConn, s *Store) error {
-	addr := conn.RemoteAddr().(*net.UnixAddr)
+	addr := conn.LocalAddr().(*net.UnixAddr)
 
 	for _, e := range s.entries {
 		// create our sd_notify state

@@ -11,7 +11,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func ListenFDs() map[string]*os.File {
+// ListenFDs is like sd_listen_fds_with_names (https://www.freedesktop.org/software/systemd/man/latest/sd_listen_fds_with_names.html)
+func ListenFDs() map[string][]*os.File {
 	pid, err := strconv.Atoi(os.Getenv("LISTEN_PID"))
 	if err != nil || pid != os.Getpid() {
 		return nil
@@ -24,7 +25,7 @@ func ListenFDs() map[string]*os.File {
 
 	names := strings.Split(os.Getenv("LISTEN_FDNAMES"), ":")
 
-	files := make(map[string]*os.File, numFds)
+	files := make(map[string][]*os.File, numFds)
 	for i := 0; i < numFds; i++ {
 		// 0, 1, 2 are reserved for stdin, stdout, stderr; start from 3
 		fd := i + 3
@@ -35,7 +36,7 @@ func ListenFDs() map[string]*os.File {
 		if i < len(names) {
 			name = names[i]
 		}
-		files[name] = os.NewFile(uintptr(fd), name)
+		files[name] = append(files[name], os.NewFile(uintptr(fd), name))
 	}
 	return files
 }
@@ -56,6 +57,31 @@ func NotifySocket() (*net.UnixConn, error) {
 	}
 
 	return conn, nil
+}
+
+// Send is like sd_notify (https://www.freedesktop.org/software/systemd/man/latest/sd_notify.html#Description),
+// as a special case, if conn is nil Send will try to use the return value of NotifySocket
+func Send(conn *net.UnixConn, vars ...Variable) error {
+	// grab the notify socket if we got passed nil
+	if conn == nil {
+		ns, err := NotifySocket()
+		if err != nil {
+			return err
+		}
+		conn = ns
+	}
+
+	// construct our state line, these should be new-line separated
+	var state Variable
+	for _, v := range vars {
+		if !strings.HasSuffix(v, "\n") {
+			state = state + v + "\n"
+		} else {
+			state = state + v
+		}
+	}
+	_, err := conn.Write([]byte(state))
+	return err
 }
 
 // SocketPair returns a pair of connected unix sockets.
@@ -114,7 +140,7 @@ func sendMsg(conn *net.UnixConn, addr *net.UnixAddr, state []byte, file *os.File
 	return nil
 }
 
-const scmBufSize = 64
+const scmBufSize = 64 // needs to be big enough to receive one scm with an fd in it
 
 func readMsg(conn *net.UnixConn, state []byte) (n int, fd *os.File, err error) {
 	oob := make([]byte, scmBufSize)
@@ -126,27 +152,28 @@ func readMsg(conn *net.UnixConn, state []byte) (n int, fd *os.File, err error) {
 	if len(oob) > 0 {
 		scm, err := syscall.ParseSocketControlMessage(oob)
 		if err != nil {
-			return n, nil, err
+			return n, nil, fmt.Errorf("failed to parse socket control message: %w", err)
 		}
 		if len(scm) != 1 {
-			return n, nil, fmt.Errorf("%d socket control messages", len(scm))
+			return n, nil, fmt.Errorf("too many socket control messages: %d", len(scm))
 		}
 		fds, err := syscall.ParseUnixRights(&scm[0])
 		if err != nil {
-			return n, nil, fmt.Errorf("parsing unix rights: %s", err)
+			return n, nil, fmt.Errorf("failed to parse unix rights: %w", err)
 		}
-		if len(fds) == 1 {
-			// try to set this fd as non-blocking
-			syscall.SetNonblock(fds[0], true)
-			return n, os.NewFile(uintptr(fds[0]), "<socketconn>"), nil
+		if len(fds) == 0 { // no files, just return state only
+			return n, nil, nil
 		}
-		if len(fds) > 1 {
+		if len(fds) > 1 { // too many files, we only support 1 file per message right now
 			for i := range fds {
 				syscall.Close(fds[i])
 			}
-			return n, nil, fmt.Errorf("control message sent %d fds", len(fds))
+			return n, nil, fmt.Errorf("socket control message contained too many fds: %d", len(fds))
 		}
-		// fallthrough; len(fds) == 0
+
+		// try to set this fd as non-blocking
+		_ = syscall.SetNonblock(fds[0], true)
+		return n, os.NewFile(uintptr(fds[0]), "<socketconn>"), nil
 	}
 	return n, nil, nil
 }

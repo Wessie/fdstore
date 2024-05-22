@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"strconv"
@@ -140,7 +141,7 @@ func parseName(name string) (parsedName, error) {
 	id, err := strconv.ParseUint(name[i+1:], 10, 64)
 	if err != nil {
 		// the suffix we did find wasn't an integer
-		return parsedName{}, fmt.Errorf("%w: expected uint64 suffix: %s", ErrNotOurName, name)
+		return parsedName{}, fmt.Errorf("%w: expected id to be uint64: %s", ErrNotOurName, name)
 	}
 	pn.id = id
 	// and cut off the id to get back our original name
@@ -153,19 +154,44 @@ type Store struct {
 	entries map[uint64]Entry
 }
 
-func NewStoreFromListenFDS() (*Store, error) {
-	var store Store
+// Close calls close on all the entries contained in the store and makes the store
+// invalid to use
+func (s *Store) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	// get our files from the systemd environment variables
-	files := ListenFDs()
-	if files == nil {
-		return nil, ErrNoFiles
+	for _, entry := range s.entries {
+		entry.File.Close()
 	}
 
-	for name, file := range files {
+	s.entries = nil
+}
+
+// NewStore takes a map of `name: files` and tries to turn them back into a Store instance, this
+// generally should be the output of ListenFDs after a store by SendStore in a previous process.
+// If filelist is nil an empty Store is returned.
+//
+// Entries that do not match the `{name}-{id}-[data|file]` format are ignored, entries that are interpreted
+// successfully are removed from the input filelist and added to the returned Store instead.
+func NewStore(filelist map[string][]*os.File) *Store {
+	store := Store{
+		entries: make(map[uint64]Entry),
+	}
+
+	for name, files := range filelist {
+		// we only expect one file per name due to our ID and suffix system, but there could
+		// be fds stored that we didn't add so we just ignore those
+		if len(files) != 1 {
+			continue
+		}
+		file := files[0]
+
 		p, err := parseName(name)
 		if err != nil {
-			return nil, err
+			// if we're unable to parse the name it could be an fd stored by someone else, so
+			// again we're gonna ignore it
+			log.Println(err)
+			continue
 		}
 
 		entry := store.entries[p.id]
@@ -173,12 +199,12 @@ func NewStoreFromListenFDS() (*Store, error) {
 		entry.Name = p.name
 
 		if p.isData { // data fd
-			// close the data file after we're done, so it can be cleaned up
 			defer file.Close()
 			// read the whole file into memory
 			data, err := io.ReadAll(file)
 			if err != nil {
-				return nil, fmt.Errorf("%w: %w", ErrDataRead, err)
+				log.Println(fmt.Errorf("%w: %w", ErrDataRead, err))
+				continue
 			}
 			entry.Data = data
 		}
@@ -188,9 +214,11 @@ func NewStoreFromListenFDS() (*Store, error) {
 		}
 
 		store.entries[p.id] = entry
+		// once we're done, remove us from the fileList
+		delete(filelist, name)
 	}
 
-	return &store, nil
+	return &store
 }
 
 func asConnWithoutClose(file *os.File) (net.Conn, error) {

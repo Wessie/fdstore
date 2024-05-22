@@ -105,6 +105,7 @@ func bytesToFd(data []byte, name string) (*os.File, error) {
 		fd.Close()
 		return nil, ErrShortWrite
 	}
+	_, _ = fd.File.Seek(0, 0)
 	return fd.File, nil
 }
 
@@ -192,28 +193,36 @@ func NewStore(filelist map[string][]*os.File) *Store {
 		if err != nil {
 			// if we're unable to parse the name it could be an fd stored by someone else, so
 			// again we're gonna ignore it
-			log.Println(err)
+			continue
+		}
+
+		if p.isData {
 			continue
 		}
 
 		entry := store.entries[p.id]
 		entry.ID = p.id
 		entry.Name = p.name
+		entry.File = file
 
-		if p.isData { // data fd
-			defer file.Close()
-			// read the whole file into memory
-			data, err := io.ReadAll(file)
-			if err != nil {
-				log.Println(fmt.Errorf("%w: %w", ErrDataRead, err))
-				continue
-			}
-			entry.Data = data
+		// find our data entry
+		datalist := filelist[entry.dataName()]
+		if len(datalist) != 1 {
+			// to be safe we skip an entry if the datalist contains more than one
+			// entry since we can't know which one is the latest
+			continue
 		}
+		datafile := datalist[0]
+		// seek to the start of the file just to be sure
+		_, _ = datafile.Seek(0, 0)
+		defer datafile.Close()
 
-		if p.isFile {
-			entry.File = file
+		data, err := io.ReadAll(datafile)
+		if err != nil {
+			log.Println(fmt.Errorf("%w: %w", ErrDataRead, err))
+			continue
 		}
+		entry.Data = data
 
 		store.entries[p.id] = entry
 		// once we're done, remove us from the fileList
@@ -221,6 +230,23 @@ func NewStore(filelist map[string][]*os.File) *Store {
 	}
 
 	return &store
+}
+
+// NewStoreListenFDs is like NewStore but it calls ListenFDs for you
+// and closes any fds not returned in Store
+func NewStoreListenFDs() *Store {
+	entries := ListenFDs()
+	store := NewStore(entries)
+
+	// close any files left in entries
+	for _, files := range entries {
+		for _, file := range files {
+			log.Println(fmt.Errorf("closing unused file from ListenFDs: %s", file.Name()))
+			file.Close()
+		}
+	}
+
+	return store
 }
 
 func asConnWithoutClose(file *os.File) (net.Conn, error) {
@@ -287,10 +313,11 @@ func SendStore(conn *Conn, s *Store) error {
 		}
 	}
 
-	WaitBarrier(conn)
+	_ = WaitBarrier(conn)
 	return nil
 }
 
+// WaitBarrier implements sd_notify_barrier
 func WaitBarrier(conn *Conn) error {
 	// Create a pipe for communicating with systemd daemon.
 	pipeR, pipeW, err := os.Pipe()

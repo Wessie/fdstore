@@ -36,7 +36,11 @@ func ListenFDs() map[string][]*os.File {
 		if i < len(names) {
 			name = names[i]
 		}
-		files[name] = append(files[name], os.NewFile(uintptr(fd), name))
+		file := os.NewFile(uintptr(fd), name)
+		if file == nil {
+			continue
+		}
+		files[name] = append(files[name], file)
 	}
 	return files
 }

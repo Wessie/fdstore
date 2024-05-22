@@ -23,7 +23,9 @@ func FDName(name string) Variable {
 	if len(name) > 255 {
 		return ""
 	}
-	// TODO: add name checking
+	// remove illegal characters
+	// TODO: add control codes
+	name = strings.ReplaceAll(name, ":", "")
 	return Variable("FDNAME=" + name)
 }
 

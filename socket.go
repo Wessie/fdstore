@@ -41,7 +41,7 @@ func ListenFDs() map[string][]*os.File {
 	return files
 }
 
-func NotifySocket() (*net.UnixConn, error) {
+func NotifySocket() (*Conn, error) {
 	addr := &net.UnixAddr{
 		Name: os.Getenv("NOTIFY_SOCKET"),
 		Net:  "unixgram",
@@ -51,31 +51,36 @@ func NotifySocket() (*net.UnixConn, error) {
 		return nil, ErrNoSocket
 	}
 
-	conn, err := net.ListenPacket(addr.Net, addr.String())
+	conn, err := socketUnixgram(addr.Name)
 	if err != nil {
 		return nil, err
 	}
 
-	return conn.(*net.UnixConn), nil
+	return &Conn{conn, addr}, nil
+}
+
+type Conn struct {
+	conn  *net.UnixConn
+	raddr *net.UnixAddr
 }
 
 // Send is like sd_notify (https://www.freedesktop.org/software/systemd/man/latest/sd_notify.html#Description),
 // as a special case, if conn is nil Send will try to use the return value of NotifySocket
-func Send(conn *net.UnixConn, vars ...Variable) error {
+func Send(conn *Conn, vars ...Variable) error {
 	// grab the notify socket if we got passed nil
 	if conn == nil {
 		ns, err := NotifySocket()
 		if err != nil {
 			return err
 		}
-		defer ns.Close()
+		defer ns.conn.Close()
 		conn = ns
 	}
 
 	// construct our state line, these should be new-line separated
 	state := combine(vars...)
 
-	_, err := conn.WriteTo([]byte(state), conn.LocalAddr())
+	_, err := conn.conn.WriteTo([]byte(state), conn.raddr)
 	return err
 }
 

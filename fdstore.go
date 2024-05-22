@@ -259,14 +259,12 @@ func AsListener(file *os.File) (net.Listener, error) {
 	return ln, nil
 }
 
-func SendStore(conn *net.UnixConn, s *Store) error {
-	addr := conn.LocalAddr().(*net.UnixAddr)
-
+func SendStore(conn *Conn, s *Store) error {
 	for _, e := range s.entries {
 		// create our sd_notify state
 		state := combine(FDStore, FDName(e.fileName()))
 
-		err := sendMsg(conn, addr, []byte(state), e.File)
+		err := sendMsg(conn.conn, conn.raddr, []byte(state), e.File)
 		if err != nil {
 			return fmt.Errorf("failed to send file message: %w", err)
 		}
@@ -281,7 +279,7 @@ func SendStore(conn *net.UnixConn, s *Store) error {
 		// create our sd_notify state
 		state = combine(FDStore, FDName(e.dataName()))
 
-		err = sendMsg(conn, addr, []byte(state), dataFd)
+		err = sendMsg(conn.conn, conn.raddr, []byte(state), dataFd)
 		if err != nil {
 			return fmt.Errorf("failed to send data message: %w", err)
 		}

@@ -68,9 +68,9 @@ type NotifyAccessOption string
 
 const (
 	NotifyAccessNone NotifyAccessOption = "none"
-	NotifyAccessAll                     = "all"
-	NotifyAccessMain                    = "main"
-	NotifyAccessExec                    = "exec"
+	NotifyAccessAll  NotifyAccessOption = "all"
+	NotifyAccessMain NotifyAccessOption = "main"
+	NotifyAccessExec NotifyAccessOption = "exec"
 )
 
 func NotifyAccess(na NotifyAccessOption) State {

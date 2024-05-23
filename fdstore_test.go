@@ -1,17 +1,54 @@
 package fdstore
 
 import (
-	"fmt"
 	"os"
 	"testing"
+	"testing/quick"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestParseName(t *testing.T) {
-	p, err := parseName("SOURCE-50-data")
-	fmt.Println(p, err)
-	t.Fail()
+	f := func(data shared) bool {
+		entry := Entry{shared: data}
+
+		filename := entry.fileName()
+		p, err := parseName(filename)
+		if err != nil {
+			return false
+		}
+
+		if !assert.Equal(t, entry.ID, p.id) {
+			return false
+		}
+		if !assert.Equal(t, entry.Name, p.name) {
+			return false
+		}
+		if !assert.True(t, p.isFile, "isFile should be true") {
+			return false
+		}
+
+		dataname := entry.dataName()
+		p, err = parseName(dataname)
+		if err != nil {
+			return false
+		}
+
+		if !assert.Equal(t, entry.ID, p.id) {
+			return false
+		}
+		if !assert.Equal(t, entry.Name, p.name) {
+			return false
+		}
+		if !assert.True(t, p.isData, "isData should be true") {
+			return false
+		}
+		return true
+	}
+	if err := quick.Check(f, nil); err != nil {
+		t.Error(err)
+	}
 }
 
 func TestFDNameSuffixLength(t *testing.T) {

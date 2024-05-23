@@ -1,53 +1,22 @@
 package fdstore
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
-	"strconv"
-	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
-// ListenFDs is like sd_listen_fds_with_names (https://www.freedesktop.org/software/systemd/man/latest/sd_listen_fds_with_names.html)
-func ListenFDs() map[string][]*os.File {
-	pid, err := strconv.Atoi(os.Getenv("LISTEN_PID"))
-	if err != nil || pid != os.Getpid() {
-		return nil
-	}
+var NOTIFY_SOCKET = "NOTIFY_SOCKET"
 
-	numFds, err := strconv.Atoi(os.Getenv("LISTEN_FDS"))
-	if err != nil || numFds < 1 {
-		return nil
-	}
-
-	names := strings.Split(os.Getenv("LISTEN_FDNAMES"), ":")
-
-	files := make(map[string][]*os.File, numFds)
-	for i := 0; i < numFds; i++ {
-		// 0, 1, 2 are reserved for stdin, stdout, stderr; start from 3
-		fd := i + 3
-		// systemd should be setting this already
-		unix.CloseOnExec(fd)
-
-		name := "unknown"
-		if i < len(names) {
-			name = names[i]
-		}
-		file := os.NewFile(uintptr(fd), name)
-		if file == nil {
-			continue
-		}
-		files[name] = append(files[name], file)
-	}
-	return files
-}
-
-func NotifySocket() (*Conn, error) {
+// NotifySocket returns a connected (net.DialUnix) UnixConn to the path
+// in env var NOTIFY_SOCKET, which is used by systemd to pass us the notify socket
+func NotifySocket() (*net.UnixConn, error) {
 	addr := &net.UnixAddr{
-		Name: os.Getenv("NOTIFY_SOCKET"),
+		Name: os.Getenv(NOTIFY_SOCKET),
 		Net:  "unixgram",
 	}
 
@@ -55,91 +24,48 @@ func NotifySocket() (*Conn, error) {
 		return nil, ErrNoSocket
 	}
 
-	conn, err := socketUnixgram(addr.Name)
+	conn, err := net.DialUnix(addr.Net, nil, addr)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Conn{conn, addr}, nil
+	return conn, nil
 }
 
-type Conn struct {
-	conn  *net.UnixConn
-	raddr *net.UnixAddr
+func sendMsg(conn *net.UnixConn, state []byte, file *os.File) error {
+	var files []*os.File
+	if file != nil {
+		files = []*os.File{file}
+	}
+	return sendMsgF(conn, state, files)
 }
 
-// Send is like sd_notify (https://www.freedesktop.org/software/systemd/man/latest/sd_notify.html#Description),
-// as a special case, if conn is nil Send will try to use the return value of NotifySocket
-func Send(conn *Conn, vars ...Variable) error {
-	// grab the notify socket if we got passed nil
-	if conn == nil {
-		ns, err := NotifySocket()
-		if err != nil {
-			return err
-		}
-		defer ns.conn.Close()
-		conn = ns
-	}
-
-	// construct our state line, these should be new-line separated
-	state := combine(vars...)
-
-	_, err := conn.conn.WriteTo([]byte(state), conn.raddr)
-	return err
-}
-
-// SocketPair returns a pair of connected unix sockets.
-func SocketPair() (*net.UnixConn, *net.UnixConn, error) {
-	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_DGRAM|syscall.SOCK_NONBLOCK, 0)
-	if err != nil {
-		return nil, nil, err
-	}
-	left, err := FD2Unix(fds[0])
-	if err != nil {
-		syscall.Close(fds[0])
-		syscall.Close(fds[1])
-		return nil, nil, err
-	}
-	right, err := FD2Unix(fds[1])
-	if err != nil {
-		left.Close()
-		syscall.Close(fds[1])
-		return nil, nil, err
-	}
-	return left, right, nil
-}
-
-// FD2Unix returns the fd given as a unix conn, errors if the fd
-// is not a unix conn
-func FD2Unix(fd int) (*net.UnixConn, error) {
-	osf := os.NewFile(uintptr(fd), "")
-	if osf == nil {
-		return nil, fmt.Errorf("bad file descriptor %d", fd)
-	}
-	defer osf.Close() // net.FileConn will dup(2) the fd
-	fc, err := net.FileConn(osf)
-	if err != nil {
-		return nil, err
-	}
-	uc, ok := fc.(*net.UnixConn)
-	if !ok {
-		fc.Close()
-		return nil, fmt.Errorf("couldn't convert %T to net.UnixConn", fc)
-	}
-	return uc, nil
-}
-
-func sendMsg(conn *net.UnixConn, addr *net.UnixAddr, state []byte, file *os.File) error {
-	oob := unix.UnixRights(int(file.Fd()))
-	n, oobn, err := conn.WriteMsgUnix(state, oob, addr)
+func sendMsgF(conn *net.UnixConn, state []byte, files []*os.File) error {
+	raw, err := conn.SyscallConn()
 	if err != nil {
 		return err
 	}
-	if n < len(state) {
-		return ErrShortWrite
+
+	var ids []int
+	for _, file := range files {
+		ids = append(ids, int(file.Fd()))
 	}
-	if oobn < len(oob) {
-		return ErrShortWrite
+
+	var uerr error
+	err = raw.Write(func(fd uintptr) bool {
+		var oob []byte
+		if len(ids) > 0 {
+			oob = unix.UnixRights(ids...)
+		}
+		uerr = unix.Sendmsg(int(fd), state, oob, nil, 0)
+		return !errors.Is(uerr, syscall.EAGAIN)
+	})
+	if err != nil { // control error
+		return err
+	}
+
+	if uerr != nil { // Sendmsg error
+		return uerr
 	}
 	return nil
 }
@@ -147,11 +73,25 @@ func sendMsg(conn *net.UnixConn, addr *net.UnixAddr, state []byte, file *os.File
 const scmBufSize = 64 // needs to be big enough to receive one scm with an fd in it
 
 func readMsg(conn *net.UnixConn, state []byte) (n int, fd *os.File, err error) {
-	oob := make([]byte, scmBufSize)
-	n, oobn, _, _, err := conn.ReadMsgUnix(state, oob)
+	raw, err := conn.SyscallConn()
 	if err != nil {
-		return n, nil, err
+		return 0, nil, err
 	}
+
+	var oobn int
+	var uerr error
+	oob := make([]byte, scmBufSize)
+	err = raw.Read(func(fd uintptr) bool {
+		n, oobn, _, _, uerr = unix.Recvmsg(int(fd), state, oob, 0)
+		return !errors.Is(uerr, syscall.EAGAIN)
+	})
+	if err != nil {
+		return 0, nil, err
+	}
+	if uerr != nil {
+		return 0, nil, uerr
+	}
+
 	oob = oob[:oobn]
 	if len(oob) > 0 {
 		scm, err := syscall.ParseSocketControlMessage(oob)
@@ -180,18 +120,4 @@ func readMsg(conn *net.UnixConn, state []byte) (n int, fd *os.File, err error) {
 		return n, os.NewFile(uintptr(fds[0]), "<socketconn>"), nil
 	}
 	return n, nil, nil
-}
-
-func socketUnixgram(name string) (*net.UnixConn, error) {
-	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
-	if err != nil {
-		return nil, os.NewSyscallError("socket", err)
-	}
-	defer unix.Close(fd)
-	conn, err := net.FileConn(os.NewFile(uintptr(fd), name))
-	if err != nil {
-		return nil, err
-	}
-	unixConn := conn.(*net.UnixConn)
-	return unixConn, nil
 }

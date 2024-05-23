@@ -21,7 +21,7 @@ var (
 	ErrShortWrite     = errors.New("short write")
 	ErrNoFile         = errors.New("File method missing")
 	ErrNoFiles        = errors.New("received no files from parent")
-	ErrNoSocket       = errors.New("NOTIFY_SOCKET envvar is empty")
+	ErrNoSocket       = errors.New("NOTIFY_SOCKET is empty")
 	ErrNotOurName     = errors.New("FDNAME was not the correct format")
 	ErrWrongType      = errors.New("fd is of the wrong type")
 	ErrDataRead       = errors.New("failed to read data from memfd")
@@ -170,15 +170,67 @@ func (s *Store) Close() {
 	s.entries = nil
 }
 
-// NewStore takes a map of `name: files` and tries to turn them back into a Store instance, this
-// generally should be the output of ListenFDs after a store by SendStore in a previous process.
-// If filelist is nil an empty Store is returned.
-//
-// Entries that do not match the `{name}-{id}-[data|file]` format are ignored, entries that are interpreted
-// successfully are removed from the input filelist and added to the returned Store instead.
-func NewStore(filelist map[string][]*os.File) *Store {
-	store := Store{
-		entries: make(map[uint64]Entry),
+func (s *Store) Send() error {
+	conn, err := NotifySocket()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	// send the store over the notify socket
+	if err = s.send(conn); err != nil {
+		return err
+	}
+	// wait for systemd to have received all our messages
+	err = WaitBarrierConn(conn, time.Second*5)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) send(conn *net.UnixConn) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, e := range s.entries {
+		// create our sd_notify state
+		state := Combine(FDStore, FDName(e.fileName()))
+
+		// send the actual fd in the entry
+		err := sendMsg(conn, []byte(state), e.File)
+		if err != nil {
+			return fmt.Errorf("failed to send file message: %w", err)
+		}
+
+		// then send data only if it exists
+		if len(e.Data) == 0 {
+			continue
+		}
+
+		dataFd, err := e.dataToFd()
+		if err != nil {
+			return fmt.Errorf("failed to prep data memfd: %w", err)
+		}
+		defer dataFd.Close()
+
+		// create our sd_notify state
+		state = Combine(FDStore, FDName(e.dataName()))
+
+		err = sendMsg(conn, []byte(state), dataFd)
+		if err != nil {
+			return fmt.Errorf("failed to send data message: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) readFilelist(filelist map[string][]*os.File) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.entries == nil {
+		s.entries = make(map[uint64]Entry)
 	}
 
 	for name, files := range filelist {
@@ -197,38 +249,52 @@ func NewStore(filelist map[string][]*os.File) *Store {
 		}
 
 		if p.isData {
+			// if it's a data name we skip it, once we reach the file entry we read it instead
 			continue
 		}
 
-		entry := store.entries[p.id]
+		entry := s.entries[p.id]
 		entry.ID = p.id
 		entry.Name = p.name
 		entry.File = file
 
 		// find our data entry
-		datalist := filelist[entry.dataName()]
-		if len(datalist) != 1 {
-			// to be safe we skip an entry if the datalist contains more than one
-			// entry since we can't know which one is the latest
-			continue
-		}
-		datafile := datalist[0]
-		// seek to the start of the file just to be sure
-		_, _ = datafile.Seek(0, 0)
-		defer datafile.Close()
+		if datalist := filelist[entry.dataName()]; len(datalist) == 1 {
+			// we only use the data entry if there was just one of them.
+			// if there were multiple it might mean we got one from
+			// an older process, so we can't know which one is newer.
+			datafile := datalist[0]
+			// seek to the start of the file just to be sure
+			_, _ = datafile.Seek(0, 0)
+			defer datafile.Close()
 
-		data, err := io.ReadAll(datafile)
-		if err != nil {
-			log.Println(fmt.Errorf("%w: %w", ErrDataRead, err))
-			continue
+			// read the data from the file
+			data, err := io.ReadAll(datafile)
+			if err != nil {
+				// we only log data errors, this should rarely happen
+				log.Println(fmt.Errorf("%w: %w", ErrDataRead, err))
+			}
+			entry.Data = data
+			// once we're done with the datafile, remove it from the filelist
+			delete(filelist, entry.dataName())
 		}
-		entry.Data = data
 
-		store.entries[p.id] = entry
+		s.entries[p.id] = entry
 		// once we're done, remove us from the fileList
 		delete(filelist, name)
 	}
+}
 
+// NewStore takes a map of `name: files` and tries to turn them back into a Store instance, this
+// generally should be the output of ListenFDs after a store by Store.Send in a previous process.
+// If filelist is nil an empty Store is returned.
+//
+// Entries that do not match the `{name}-{id}-[data|file]` format are ignored, entries that are interpreted
+// successfully are removed from the input filelist and added to the returned Store instead.
+func NewStore(filelist map[string][]*os.File) *Store {
+	var store Store
+
+	store.readFilelist(filelist)
 	return &store
 }
 
@@ -239,9 +305,9 @@ func NewStoreListenFDs() *Store {
 	store := NewStore(entries)
 
 	// close any files left in entries
-	for _, files := range entries {
+	for name, files := range entries {
 		for _, file := range files {
-			log.Println(fmt.Errorf("closing unused file from ListenFDs: %s", file.Name()))
+			log.Println(fmt.Errorf("closing unused file from ListenFDs: %s: %s", name, file.Name()))
 			file.Close()
 		}
 	}
@@ -285,73 +351,6 @@ func AsListener(file *os.File) (net.Listener, error) {
 	}
 	file.Close()
 	return ln, nil
-}
-
-func SendStore(conn *Conn, s *Store) error {
-	for _, e := range s.entries {
-		// create our sd_notify state
-		state := combine(FDStore, FDName(e.fileName()))
-
-		err := sendMsg(conn.conn, conn.raddr, []byte(state), e.File)
-		if err != nil {
-			return fmt.Errorf("failed to send file message: %w", err)
-		}
-
-		// then prep our data
-		dataFd, err := e.dataToFd()
-		if err != nil {
-			return fmt.Errorf("failed to prep data memfd: %w", err)
-		}
-		defer dataFd.Close()
-
-		// create our sd_notify state
-		state = combine(FDStore, FDName(e.dataName()))
-
-		err = sendMsg(conn.conn, conn.raddr, []byte(state), dataFd)
-		if err != nil {
-			return fmt.Errorf("failed to send data message: %w", err)
-		}
-	}
-
-	_ = WaitBarrier(conn)
-	return nil
-}
-
-// WaitBarrier implements sd_notify_barrier
-func WaitBarrier(conn *Conn) error {
-	// Create a pipe for communicating with systemd daemon.
-	pipeR, pipeW, err := os.Pipe()
-	if err != nil {
-		return err
-	}
-
-	err = sendMsg(conn.conn, conn.raddr, []byte(Barrier), pipeW)
-	if err != nil {
-		return err
-	}
-
-	// Close our copy of pipeW.
-	err = pipeW.Close()
-	if err != nil {
-		return err
-	}
-
-	// Expect the read end of the pipe to be closed after 30 seconds.
-	err = pipeR.SetReadDeadline(time.Now().Add(30 * time.Second))
-	if err != nil {
-		return nil
-	}
-
-	// Read a single byte expecting EOF.
-	var buf [1]byte
-	n, err := pipeR.Read(buf[:])
-	if n != 0 || err == nil {
-		return ErrUnexpectedRead
-	} else if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, io.EOF) {
-		return nil
-	} else {
-		return err
-	}
 }
 
 // RemoveFile finds and removes the entries associated with the name given

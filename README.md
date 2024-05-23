@@ -4,4 +4,4 @@
 ![Test](https://github.com/Wessie/fdstore/actions/workflows/test.yml/badge.svg)
 
 A helper package to communicate with systemd through the sd_notify api, implements an abstraction layer on top of
-the (file descriptor store)[https://systemd.io/FILE_DESCRIPTOR_STORE/] of systemd.
+the [file descriptor store](https://systemd.io/FILE_DESCRIPTOR_STORE/) of systemd.

@@ -1,10 +1,13 @@
 package fdstore
 
 import (
+	"crypto/rand"
+	"io"
 	"os"
 	"testing"
 	"testing/quick"
 
+	"github.com/justincormack/go-memfd"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -60,19 +63,51 @@ func TestStoreAddRemove(t *testing.T) {
 	defer store.Close()
 
 	a, data := testFile(t), []byte(nil)
-	store.AddFile(a, "A", data)
+	err := store.AddFile(a, "A", data)
+	require.NoError(t, err)
 	entries := store.RemoveFile("A")
 	require.Len(t, entries, 1)
-	require.Equal(t, entries[0].File, a)
+	compareFiles(t, entries[0].File, a)
 	require.Equal(t, entries[0].Data, data)
 }
 
 func testFile(t *testing.T) *os.File {
-	f, err := os.CreateTemp("", "test")
+	f, err := memfd.Create()
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		f.Close()
-		os.Remove(f.Name())
 	})
-	return f
+
+	return f.File
+}
+
+func TestBytesToFd(t *testing.T) {
+	data := make([]byte, 4096)
+	_, err := rand.Read(data)
+	require.NoError(t, err)
+
+	f, err := bytesToFd(data, "test")
+	require.NoError(t, err)
+	defer f.Close()
+
+	out, err := io.ReadAll(f)
+	require.NoError(t, err)
+
+	require.Equal(t, data, out)
+}
+
+func TestDataToFd(t *testing.T) {
+	data := make([]byte, 4096)
+	_, err := rand.Read(data)
+	require.NoError(t, err)
+
+	entry := NewEntry("test", nil, data)
+	f, err := entry.dataToFd()
+	require.NoError(t, err)
+	defer f.Close()
+
+	out, err := io.ReadAll(f)
+	require.NoError(t, err)
+
+	require.Equal(t, data, out)
 }

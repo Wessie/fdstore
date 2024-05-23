@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/justincormack/go-memfd"
@@ -125,13 +126,12 @@ func parseName(name string) (parsedName, error) {
 	}
 
 	if !pn.isFile && !pn.isData {
-		// neither suffix was found, this probably means we're not handling names
-		// we made, so error out
+		// neither suffix was found, this probably means we're not handling names we made
 		return parsedName{}, fmt.Errorf("%w: expected file or data suffix: %s", ErrNotOurName, name)
 	}
 
 	// suffix was found, cut it off and continue
-	name = name[:len(name)-5]
+	name = name[:len(name)-len(fileSuffix)]
 
 	// next should be our ID suffixed to the end
 	i := strings.LastIndexByte(name, '-')
@@ -152,13 +152,14 @@ func parseName(name string) (parsedName, error) {
 	return pn, nil
 }
 
+// Store is an abstraction on top of the file descriptor store of systemd, it lets you collect
+// files, connections and listeners before sending them over to systemd for storage during restarts
 type Store struct {
 	mu      sync.Mutex
 	entries map[uint64]Entry
 }
 
-// Close calls close on all the entries contained in the store and makes the store
-// invalid to use
+// Close calls close on all files contained in the store and empties its internal map
 func (s *Store) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -177,12 +178,16 @@ func (s *Store) Send() error {
 	}
 	defer conn.Close()
 
+	return s.SendConn(conn)
+}
+
+func (s *Store) SendConn(conn *net.UnixConn) error {
 	// send the store over the notify socket
-	if err = s.send(conn); err != nil {
+	if err := s.send(conn); err != nil {
 		return err
 	}
 	// wait for systemd to have received all our messages
-	err = WaitBarrierConn(conn, time.Second*5)
+	err := WaitBarrierConn(conn, time.Second*5)
 	if err != nil {
 		return err
 	}
@@ -477,15 +482,38 @@ func (s *Store) RemoveListener(name string) (res []ListenerEntry, err error) {
 	return res, nil
 }
 
-// AddFile adds a file to the store with the name given and associated data.
-// The data is stored in an memfd when passed through the socket and can be
-// any kind of data.
-func (s *Store) AddFile(fd *os.File, name string, data []byte) {
+func (s *Store) addFile(fd *os.File, name string, data []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	entry := NewEntry(name, fd, data)
 	s.entries[entry.ID] = entry
+}
+
+// AddFile adds a file to the store with the name given and associated data.
+// The data is stored in an memfd when passed through the socket and can be
+// any kind of data. The file given is duplicated before storing it
+func (s *Store) AddFile(file *os.File, name string, data []byte) error {
+	raw, err := file.SyscallConn()
+	if err != nil {
+		return err
+	}
+
+	var serr error
+	err = raw.Control(func(fd uintptr) {
+		var newFd int
+		newFd, serr = syscall.Dup(int(fd))
+		file = os.NewFile(uintptr(newFd), file.Name())
+	})
+	if err != nil { // control error
+		return err
+	}
+	if serr != nil { // dup error
+		return serr
+	}
+
+	s.addFile(file, name, data)
+	return nil
 }
 
 // AddFiler is like AddFile but takes any type with a File() (*os.File, error) method
@@ -496,12 +524,12 @@ func (s *Store) AddFiler(filer Filer, name string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	s.AddFile(fd, name, data)
+	s.addFile(fd, name, data)
 	return nil
 }
 
 // AddConn is like AddFile but takes a net.Conn, it is expected that the net.Conn
-// given implements Filer. Types from the net pkg generally do.
+// given implements Filer. AddConn duplicates the connection fd
 //
 // Returns error matching ErrNoFile if no File method was found or whatever the call
 // to File() itself returns if it errors
@@ -513,7 +541,7 @@ func (s *Store) AddConn(conn net.Conn, name string, data []byte) error {
 }
 
 // AddListener is like AddFile but takes a net.Listener, is is expected that the net.Listener
-// given implements Filer. Types from the net pkg generally do.
+// given implements Filer. AddListener duplicates the listener fd
 //
 // Returns error matching ErrNoFile if no File method was found or whatever the call
 // to File() itself returns if it errors

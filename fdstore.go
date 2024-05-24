@@ -56,7 +56,7 @@ func NewStore(opts ...Option) *Store {
 }
 
 // NewStoreListenFDs is a helper function to use the systemd default configuration and read and
-// process the files stored in the fdstore. Equal to NewStore() followed by Store.Restore
+// process the files stored in the fdstore. Equal to NewStore() followed by a call to Restore()
 func NewStoreListenFDs() *Store {
 	store := NewStore()
 	store.Restore()
@@ -261,6 +261,8 @@ func (s *Store) Close() {
 	s.entries = nil
 }
 
+// Send sends the contents of the store over the configured NOTIFY_SOCKET with the systemd
+// sd_pid_notify_with_fds api
 func (s *Store) Send() error {
 	conn, err := NotifySocket()
 	if err != nil {
@@ -271,6 +273,7 @@ func (s *Store) Send() error {
 	return s.SendConn(conn)
 }
 
+// SendConn is like Send but lets you pass in your own conn
 func (s *Store) SendConn(conn *net.UnixConn) error {
 	// send the store over the notify socket
 	if err := s.send(conn); err != nil {
@@ -410,10 +413,11 @@ func (s *Store) RestoreFilelist(filelist map[string][]*os.File) {
 }
 
 // Restore tries to restore the files from the fdstore, files that don't match what we expect
-// are closed and removed from the fdstore through FDSTOREREMOVE
+// are closed and removed from the fdstore through FDSTOREREMOVE, the environment variables
+// configured to be used are unset after a call to Restore
 func (s *Store) Restore() {
 	// get the list of files from the environment
-	filelist := s.restoreFds()
+	filelist := s.restoreFds(true)
 	// try and restore them with Store logic
 	s.RestoreFilelist(filelist)
 

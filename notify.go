@@ -182,7 +182,7 @@ func WaitBarrierConn(conn *net.UnixConn, timeout time.Duration) error {
 }
 
 // restoreFds is like sd_listen_fds_with_names (https://www.freedesktop.org/software/systemd/man/latest/sd_listen_fds_with_names.html)
-func (s *Store) restoreFds() map[string][]*os.File {
+func (s *Store) restoreFds(unset bool) map[string][]*os.File {
 	pid, err := strconv.Atoi(os.Getenv(s.opts.listenPid))
 	if err != nil || pid != os.Getpid() {
 		return nil
@@ -195,9 +195,15 @@ func (s *Store) restoreFds() map[string][]*os.File {
 
 	names := strings.Split(os.Getenv(s.opts.listenFdNames), ":")
 
+	if unset { // unset the variables we used if asked for
+		os.Unsetenv(s.opts.listenPid)
+		os.Unsetenv(s.opts.listenFds)
+		os.Unsetenv(s.opts.listenFdNames)
+	}
+
 	files := make(map[string][]*os.File, numFds)
 	for i := 0; i < numFds; i++ {
-		// 0, 1, 2 are reserved for stdin, stdout, stderr; start from 3
+		// start from where we got configured, this is generally 3 after (0 stdin, 1 stdout, 2 stderr)
 		fd := i + s.opts.listenFdStart
 		// systemd should be setting this already
 		unix.CloseOnExec(fd)

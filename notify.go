@@ -223,5 +223,5 @@ func (s *Store) restoreFds(unset bool) map[string][]*os.File {
 
 // notify is like Notify but using the configured notify socket in the store
 func (s *Store) notifySocket() (*net.UnixConn, error) {
-	return NotifySocketNamed(s.opts.notifySocket)
+	return NotifySocketNamed(os.Getenv(s.opts.notifySocket))
 }

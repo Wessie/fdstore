@@ -10,13 +10,22 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-var NOTIFY_SOCKET = "NOTIFY_SOCKET"
+var (
+	NOTIFY_SOCKET  = "NOTIFY_SOCKET"
+	LISTEN_PID     = "LISTEN_PID"
+	LISTEN_FDS     = "LISTEN_FDS"
+	LISTEN_FDNAMES = "LISTEN_FDNAMES"
+)
 
-// NotifySocket returns a connected (net.DialUnix) UnixConn to the path
-// in env var NOTIFY_SOCKET, which is used by systemd to pass us the notify socket
+// NotifySocket returns a connected UnixConn to the path in env NOTIFY_SOCKET
 func NotifySocket() (*net.UnixConn, error) {
+	return NotifySocketNamed(os.Getenv(NOTIFY_SOCKET))
+}
+
+// NotifySocketNamed is like NotifySocket but lets you pick the name of the socket
+func NotifySocketNamed(name string) (*net.UnixConn, error) {
 	addr := &net.UnixAddr{
-		Name: os.Getenv(NOTIFY_SOCKET),
+		Name: name,
 		Net:  "unixgram",
 	}
 

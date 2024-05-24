@@ -59,7 +59,7 @@ func TestFDNameSuffixLength(t *testing.T) {
 }
 
 func TestStoreAddRemove(t *testing.T) {
-	store := NewStore(nil)
+	store := NewStore()
 	defer store.Close()
 
 	a, data := testFile(t), []byte(nil)
@@ -101,7 +101,7 @@ func TestDataToFd(t *testing.T) {
 	_, err := rand.Read(data)
 	require.NoError(t, err)
 
-	entry := NewEntry("test", nil, data)
+	entry := newEntry("test", nil, data)
 	f, err := entry.dataToFd()
 	require.NoError(t, err)
 	defer f.Close()
@@ -110,4 +110,33 @@ func TestDataToFd(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, data, out)
+}
+
+func TestStoreReadFilelist(t *testing.T) {
+	var entries []Entry
+
+	for range 20 {
+		data := make([]byte, 4096)
+		_, err := rand.Read(data)
+		require.NoError(t, err)
+		file := testFile(t)
+
+		entries = append(entries, newEntry("test", file, data))
+	}
+
+	filelist := make(map[string][]*os.File)
+	for _, e := range entries {
+		filelist[e.fileName()] = append(filelist[e.fileName()], e.File)
+		data, err := e.dataToFd()
+		require.NoError(t, err)
+		filelist[e.dataName()] = append(filelist[e.dataName()], data)
+	}
+
+	store := NewStore()
+	require.NotNil(t, store)
+	store.RestoreFilelist(filelist)
+
+	out := store.RemoveFile("test")
+	require.Len(t, out, len(entries))
+	require.Len(t, filelist, 0)
 }

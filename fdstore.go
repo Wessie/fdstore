@@ -21,7 +21,6 @@ import (
 var (
 	ErrShortWrite     = errors.New("short write")
 	ErrNoFile         = errors.New("File method missing")
-	ErrNoFiles        = errors.New("received no files from parent")
 	ErrNoSocket       = errors.New("NOTIFY_SOCKET is empty")
 	ErrNotOurName     = errors.New("FDNAME was not the correct format")
 	ErrWrongType      = errors.New("fd is of the wrong type")
@@ -36,29 +35,100 @@ const (
 	fileSuffix = "-file"
 )
 
+var defaultOptions = storeOptions{
+	notifySocket:  NOTIFY_SOCKET,
+	listenPid:     LISTEN_PID,
+	listenFds:     LISTEN_FDS,
+	listenFdNames: LISTEN_FDNAMES,
+	listenFdStart: 3,
+	logFn:         func(s string) { log.Println(s) },
+}
+
+// NewStore creates a new Store instance with the options given. Store is an abstraction on top of
+// the systemd file descriptor store interface that lets you pass fds to systemd between service
+// restarts. The defaults are configured to use what systemd uses.
+func NewStore(opts ...Option) *Store {
+	var store Store
+	store.entries = make(map[uint64]Entry)
+	store.opts = defaultOptions
+	store.opts.apply(opts...)
+	return &store
+}
+
+// NewStoreListenFDs is a helper function to use the systemd default configuration and read and
+// process the files stored in the fdstore. Equal to NewStore() followed by Store.Restore
+func NewStoreListenFDs() *Store {
+	store := NewStore()
+	store.Restore()
+	return store
+}
+
+// NotifySocketOpt changes what environment variable to use instead of NOTIFY_SOCKET
+func NotifySocketOpt(name string) Option {
+	return func(so *storeOptions) {
+		so.notifySocket = name
+	}
+}
+
+// ListenFDsOpt changes what environment variable to use instead of LISTEN_FDS
+func ListenFDsOpt(name string) Option {
+	return func(so *storeOptions) {
+		so.listenFds = name
+	}
+}
+
+// ListenFDNamesOpt changes what environment variable to use instead of LISTEN_FDNAMES
+func ListenFDNamesOpt(name string) Option {
+	return func(so *storeOptions) {
+		so.listenFdNames = name
+	}
+}
+
+// ListenFDStartOpt changes at what fd number to start, the default is 3 since 0, 1, 2 are
+// stdin, stdout, stderr respectively.
+func ListenFDStartOpt(n int) Option {
+	return func(so *storeOptions) {
+		so.listenFdStart = n
+	}
+}
+
+type LogFn func(string)
+
+// LoggerOpt changes where log lines go to, the default uses the log pkg
+func LoggerOpt(fn LogFn) Option {
+	return func(so *storeOptions) {
+		so.logFn = fn
+	}
+}
+
+// ListenPIDOpt changes what environment variable to use instead of LISTEN_PID
+func ListenPIDOpt(name string) Option {
+	return func(so *storeOptions) {
+		so.listenPid = name
+	}
+}
+
 type Filer interface {
 	File() (*os.File, error)
 }
 
-func NewEntry(name string, file *os.File, data []byte) Entry {
-	return Entry{
-		shared: shared{
-			ID:   incrementalID.Add(1),
-			Name: name,
-			Data: data,
-		},
-		File: file,
-	}
+// Store is an abstraction on top of the file descriptor store of systemd, it lets you collect
+// files, connections and listeners before sending them over to systemd for storage during restarts
+type Store struct {
+	mu      sync.Mutex
+	entries map[uint64]Entry
+	opts    storeOptions
 }
 
-type shared struct {
-	// ID is a 'unique' id for this entry, it's an atomically incrementing integer,
-	// used to match the File and Data together after passing over
-	ID uint64
-	// Name is the name for this entry, this is how the user looks us up
-	Name string
-	// Data is the data associated with this entry, this can be anything
-	Data []byte
+type Option func(*storeOptions)
+
+type storeOptions struct {
+	notifySocket  string // NOTIFY_SOCKET environment variable
+	listenPid     string // LISTEN_PID environment variable
+	listenFds     string // LISTEN_FDS environment variable
+	listenFdNames string // LISTEN_FDNAMES environment variable
+	listenFdStart int    // what fd number to start at
+	logFn         LogFn
 }
 
 type Entry struct {
@@ -77,6 +147,27 @@ type ConnEntry struct {
 type ListenerEntry struct {
 	shared
 	Listener net.Listener
+}
+
+func newEntry(name string, file *os.File, data []byte) Entry {
+	return Entry{
+		shared: shared{
+			ID:   incrementalID.Add(1),
+			Name: name,
+			Data: data,
+		},
+		File: file,
+	}
+}
+
+type shared struct {
+	// ID is a 'unique' id for this entry, it's an atomically incrementing integer,
+	// used to match the File and Data together after passing over
+	ID uint64
+	// Name is the name for this entry, this is how the user looks us up
+	Name string
+	// Data is the data associated with this entry, this can be anything
+	Data []byte
 }
 
 func (e Entry) dataToFd() (*os.File, error) {
@@ -152,11 +243,10 @@ func parseName(name string) (parsedName, error) {
 	return pn, nil
 }
 
-// Store is an abstraction on top of the file descriptor store of systemd, it lets you collect
-// files, connections and listeners before sending them over to systemd for storage during restarts
-type Store struct {
-	mu      sync.Mutex
-	entries map[uint64]Entry
+func (so *storeOptions) apply(opts ...Option) {
+	for _, opt := range opts {
+		opt(so)
+	}
 }
 
 // Close calls close on all files contained in the store and empties its internal map
@@ -230,12 +320,41 @@ func (s *Store) send(conn *net.UnixConn) error {
 	return nil
 }
 
-func (s *Store) readFilelist(filelist map[string][]*os.File) {
+func (s *Store) logf(format string, args ...any) {
+	s.opts.logFn(fmt.Sprintf(format, args...))
+}
+
+func (s *Store) errorf(format string, args ...any) {
+	s.opts.logFn(fmt.Errorf(format, args...).Error())
+}
+
+// RestoreFilelist takes a list of files with names, typically retrieved from another
+// process and tries to parse the names as if they were send by Store.Send
+func (s *Store) RestoreFilelist(filelist map[string][]*os.File) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.entries == nil {
 		s.entries = make(map[uint64]Entry)
+	}
+
+	conn, err := s.notifySocket()
+	if err != nil {
+		s.errorf("RestoreFilelist failed socket creation: %w", err)
+	} else {
+		defer conn.Close()
+	}
+
+	deleteFn := func(name string) {
+		if conn != nil {
+			// send a remove to systemd as well for consistency
+			// but only best-effort, ignore the error
+			err := NotifyConn(conn, FDStoreRemove(name))
+			if err != nil {
+				s.errorf("RestoreFilelist failed FDSTOREREMOVE: %w", err)
+			}
+		}
+		delete(filelist, name)
 	}
 
 	for name, files := range filelist {
@@ -277,47 +396,53 @@ func (s *Store) readFilelist(filelist map[string][]*os.File) {
 			data, err := io.ReadAll(datafile)
 			if err != nil {
 				// we only log data errors, this should rarely happen
-				log.Println(fmt.Errorf("%w: %w", ErrDataRead, err))
+				s.errorf("%w: %w", ErrDataRead, err)
 			}
 			entry.Data = data
 			// once we're done with the datafile, remove it from the filelist
-			delete(filelist, entry.dataName())
+			deleteFn(entry.dataName())
 		}
 
 		s.entries[p.id] = entry
 		// once we're done, remove us from the fileList
-		delete(filelist, name)
+		deleteFn(name)
 	}
 }
 
-// NewStore takes a map of `name: files` and tries to turn them back into a Store instance, this
-// generally should be the output of ListenFDs after a store by Store.Send in a previous process.
-// If filelist is nil an empty Store is returned.
-//
-// Entries that do not match the `{name}-{id}-[data|file]` format are ignored, entries that are interpreted
-// successfully are removed from the input filelist and added to the returned Store instead.
-func NewStore(filelist map[string][]*os.File) *Store {
-	var store Store
+// Restore tries to restore the files from the fdstore, files that don't match what we expect
+// are closed and removed from the fdstore through FDSTOREREMOVE
+func (s *Store) Restore() {
+	// get the list of files from the environment
+	filelist := s.restoreFds()
+	// try and restore them with Store logic
+	s.RestoreFilelist(filelist)
 
-	store.readFilelist(filelist)
-	return &store
-}
+	// cleanup any leftover files
+	if len(filelist) == 0 {
+		return
+	}
 
-// NewStoreListenFDs is like NewStore but it calls ListenFDs for you
-// and closes any fds not returned in Store
-func NewStoreListenFDs() *Store {
-	entries := ListenFDs()
-	store := NewStore(entries)
+	// setup a notify conn for FDStoreRemove
+	conn, err := s.notifySocket()
+	if err != nil {
+		s.errorf("Restore: failed socket creation: %w", err)
+	} else {
+		defer conn.Close()
+	}
 
-	// close any files left in entries
-	for name, files := range entries {
+	// close any files left in the filelist and remove them from the fdstore if we can
+	for name, files := range filelist {
 		for _, file := range files {
-			log.Println(fmt.Errorf("closing unused file from ListenFDs: %s: %s", name, file.Name()))
+			s.logf("Restore: closing unused file from environment: %s: %s", name, file.Name())
 			file.Close()
 		}
+		if conn != nil {
+			err := NotifyConn(conn, FDStoreRemove(name))
+			if err != nil {
+				s.errorf("Restore: failed FDSTOREREMOVE: %w", err)
+			}
+		}
 	}
-
-	return store
 }
 
 func asConnWithoutClose(file *os.File) (net.Conn, error) {
@@ -405,7 +530,7 @@ func (s *Store) RemoveConn(name string) (res []ConnEntry, err error) {
 			continue
 		}
 
-		// this will dup(2) the file
+		// this will dup the file
 		conn, err := asConnWithoutClose(entry.File)
 		if err != nil {
 			return nil, err
@@ -486,7 +611,7 @@ func (s *Store) addFile(fd *os.File, name string, data []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	entry := NewEntry(name, fd, data)
+	entry := newEntry(name, fd, data)
 	s.entries[entry.ID] = entry
 }
 

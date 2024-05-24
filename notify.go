@@ -16,14 +16,14 @@ import (
 type State string
 
 const (
-	Ready           = "READY=1"
-	Reloading       = "RELOADING=1"
-	Stopping        = "STOPPING=1"
-	Watchdog        = "WATCHDOG=1"
-	WatchdogTrigger = "WATCHDOG=trigger"
-	FDStore         = "FDSTORE=1"
-	FDPoll          = "FDPOLL=0"
-	Barrier         = "BARRIER=1"
+	Ready           State = "READY=1"
+	Reloading       State = "RELOADING=1"
+	Stopping        State = "STOPPING=1"
+	Watchdog        State = "WATCHDOG=1"
+	WatchdogTrigger State = "WATCHDOG=trigger"
+	FDStore         State = "FDSTORE=1"
+	FDPoll          State = "FDPOLL=0"
+	Barrier         State = "BARRIER=1"
 )
 
 func IsValidFDName(name string) bool {
@@ -113,7 +113,7 @@ func NotifyConn(conn *net.UnixConn, state ...State) error {
 
 // NotifyWithFDs is like sd_notify_with_fds
 // We add FDSTORE=1 and FDNAME={name} for you with the name given, the rest of state
-// is prepended to the other two
+// is prepended before the other two
 func NotifyWithFDs(name string, files []*os.File, state ...State) error {
 	conn, err := NotifySocket()
 	if err != nil {
@@ -153,6 +153,7 @@ func WaitBarrierConn(conn *net.UnixConn, timeout time.Duration) error {
 
 	err = sendMsg(conn, []byte(Barrier), pipeW)
 	if err != nil {
+		pipeW.Close()
 		return err
 	}
 
@@ -180,24 +181,24 @@ func WaitBarrierConn(conn *net.UnixConn, timeout time.Duration) error {
 	}
 }
 
-// ListenFDs is like sd_listen_fds_with_names (https://www.freedesktop.org/software/systemd/man/latest/sd_listen_fds_with_names.html)
-func ListenFDs() map[string][]*os.File {
-	pid, err := strconv.Atoi(os.Getenv("LISTEN_PID"))
+// restoreFds is like sd_listen_fds_with_names (https://www.freedesktop.org/software/systemd/man/latest/sd_listen_fds_with_names.html)
+func (s *Store) restoreFds() map[string][]*os.File {
+	pid, err := strconv.Atoi(os.Getenv(s.opts.listenPid))
 	if err != nil || pid != os.Getpid() {
 		return nil
 	}
 
-	numFds, err := strconv.Atoi(os.Getenv("LISTEN_FDS"))
+	numFds, err := strconv.Atoi(os.Getenv(s.opts.listenFds))
 	if err != nil || numFds < 1 {
 		return nil
 	}
 
-	names := strings.Split(os.Getenv("LISTEN_FDNAMES"), ":")
+	names := strings.Split(os.Getenv(s.opts.listenFdNames), ":")
 
 	files := make(map[string][]*os.File, numFds)
 	for i := 0; i < numFds; i++ {
 		// 0, 1, 2 are reserved for stdin, stdout, stderr; start from 3
-		fd := i + 3
+		fd := i + s.opts.listenFdStart
 		// systemd should be setting this already
 		unix.CloseOnExec(fd)
 
@@ -212,4 +213,9 @@ func ListenFDs() map[string][]*os.File {
 		files[name] = append(files[name], file)
 	}
 	return files
+}
+
+// notify is like Notify but using the configured notify socket in the store
+func (s *Store) notifySocket() (*net.UnixConn, error) {
+	return NotifySocketNamed(s.opts.notifySocket)
 }
